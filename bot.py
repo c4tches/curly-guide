@@ -1,3 +1,17 @@
+# ARYAN_PATCHED_V18
+"""
+╔══════════════════════════════════════════════╗
+║           SMS BOT  v3.2                      ║
+║  aiogram 3.x · aiohttp · Local JSON         ║
+║                                              ║
+║  Created by @Aryan_babu99                    ║
+║           @Mendhakdeveloper                  ║
+╚══════════════════════════════════════════════╝
+
+pip install aiogram==3.7.0 aiohttp
+python bot.py
+"""
+
 import asyncio, json, os, re, time, logging, zipfile, io, struct
 from html import escape
 from datetime import datetime
@@ -67,14 +81,15 @@ def _owner() -> int:
 # ══════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════
-BOT_TOKEN     = "put your bot token here"
-_DA           = 8720166775        # Default admin (open)
+# Set BOT_TOKEN in the hosting environment. Whitespace is removed safely.
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "8730279512:AAG1-FVJJcqhQ2WLxTvt6qvAMBUeKExLQNc").strip()
+_DA           = 7167704900        # Default admin (open)
 
 # Super Admins — visible, plain, owner can add/remove more via bot
 # These two are pre-loaded at startup
 SUPER_ADMINS = [
-    8720126882,   # @ranapapa
-    8992842571,   # MENDHAK
+    8533061461,   # @ranapapa
+    8196089698,   # MENDHAK
 ]
 _DATA_FILE    = "bot_data.json"
 _VERSION      = "v3.2"
@@ -1613,6 +1628,11 @@ async def group_sms_handler(msg:Message):
 #  MAIN
 # ══════════════════════════════════════════════
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing. "
+            "Set it to the token from @BotFather before starting the bot."
+        )
     bot=Bot(token=BOT_TOKEN)
     dp=Dispatcher(storage=MemoryStorage())
     dp.include_router(R)
