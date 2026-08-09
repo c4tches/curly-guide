@@ -13,7 +13,7 @@ from aiogram.filters            import Command
 from aiogram.fsm.context        import FSMContext
 from aiogram.fsm.state          import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions         import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions         import TelegramBadRequest
 from aiogram.enums              import ChatMemberStatus
 
 # ══════════════════════════════════════════════
@@ -477,8 +477,8 @@ def sadm_menu_kb(d:dict) -> InlineKeyboardMarkup:
     for sid in sadmins:
         locked = sid in SUPER_ADMINS
         label  = f"{'🔒' if locked else '🌟'} {sid}"
-        btn    = ("🔒 Hardcoded","noop") if locked else ("🗑 Remove",f"sadm:del:{sid}")
-        rows.append([(label,"noop"), btn])
+        btn    = ("🔒 Hardcoded","<i>noop</i>") if locked else ("🗑 Remove",f"sadm:del:{sid}")
+        rows.append([(label,"<i>noop</i>"), btn])
     rows.append([("🔙 Back","adm:menu")])
     return kb(*rows)
 
@@ -486,7 +486,7 @@ def fj_menu_kb(uid:int, d:dict) -> InlineKeyboardMarkup:
     fj=d.get("force_join",[])
     rows=[[("➕ Add Force Join Channel","fj:add")]]
     for ch in fj:
-        rows.append([(f"📢 {ch.get('title','?')[:24]}","noop"),
+        rows.append([(f"📢 {ch.get('title','?')[:24]}","<i>noop</i>"),
                      ("🗑",f"fj:del:{ch['id']}")])
     rows.append([("🔙 Back","adm:menu")])
     return kb(*rows)
@@ -495,7 +495,7 @@ def list_kb(items, id_key, name_key, del_pfx, add_cb, back_cb):
     rows=[[("➕ Add New",add_cb)]]
     for item in items:
         label=str(item.get(name_key,""))[:26]
-        rows.append([(f"  {label}","noop"),(f"🗑",f"{del_pfx}{item[id_key]}")])
+        rows.append([(f"  {label}","<i>noop</i>"),(f"🗑",f"{del_pfx}{item[id_key]}")])
     rows.append([("🔙 Back",back_cb)])
     return kb(*rows)
 
@@ -552,349 +552,268 @@ def timed_kb():
     return kb(
         [("⚡ 1 Hour","tacc:3600"),    ("🕕 6 Hours","tacc:21600")],
         [("📅 24 Hours","tacc:86400"), ("📆 7 Days","tacc:604800")],
-        [("✏️ Custom", "tacc:custom")],
-        [("🔙 Back", "home")],
+        [("🔙 Back","home")],
     )
 
 
-# ══════════════════════════════════════════════
-#  MESSAGE FORWARDING MODULE
-# ══════════════════════════════════════════════
-# Stores destination chat IDs in the current user's `fwd` list.
-# Use `register_forwarding(dp)` once after creating your Dispatcher.
-
-
-def _fwd_list(u: dict) -> list:
-    """Return a clean, de-duplicated list of configured destination chat IDs."""
-    raw = u.get("fwd", [])
-    if not isinstance(raw, list):
-        raw = []
-    clean = []
-    for value in raw:
-        value = str(value).strip()
-        if value and value not in clean:
-            clean.append(value)
-    if clean != raw:
-        u["fwd"] = clean
-    return clean
-
-
-def _parse_chat_id(value: str):
-    """Accept Telegram numeric IDs and @user/channel usernames."""
-    value = str(value).strip()
-    if not value:
-        raise ValueError("empty chat ID")
-    if value.lstrip("-").isdigit():
-        return int(value)
-    if value.startswith("@"): 
-        return value
-    raise ValueError("Chat ID must be numeric or start with @")
-
-
-def fwd_menu_kb(u: dict) -> InlineKeyboardMarkup:
-    rows = []
-    for chat_id in _fwd_list(u):
-        rows.append([(f"🗑 Remove {chat_id}", f"fwd:del:{chat_id}")])
-    rows += [
-        [("➕ Add Destination", "fwd:add")],
-        [("🧪 Test Forward", "fwd:test")],
-        [("🔙 Back", "home")],
-    ]
+def fwd_kb(u: dict):
+    rows = [[("➕ Add This Chat", "fwd:add")]]
+    for chat_id in u.get("fwd", []):
+        rows.append([(f"📨 {chat_id}", "noop"), ("🗑 Remove", f"fwd:del:{chat_id}")])
+    rows.append([("🔙 Back", "home")])
     return kb(*rows)
 
 
-async def _forward_one(bot: Bot, raw_chat_id: str, text: str | None, source_message: Message | None):
-    """Deliver one item, retrying Telegram flood-wait once when required."""
-    chat_id = _parse_chat_id(raw_chat_id)
-    for attempt in range(2):
+# ---------------------------------------------------------------------------
+# Runtime helpers
+# ---------------------------------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", BOT_TOKEN)
+try:
+    _ENV_OWNER_ID = int(os.getenv("OWNER_ID", str(_owner())))
+except (TypeError, ValueError):
+    _ENV_OWNER_ID = _owner()
+_DA = _ENV_OWNER_ID
+
+_MONITOR_TASKS: dict[int, asyncio.Task] = {}
+_SEEN_SMS: dict[int, set[str]] = {}
+
+
+def _chat_id(value: str):
+    value = value.strip()
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
+def _clean_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+def _sms_from_tree(node, path=""):
+    """Extract common SMS-shaped Firebase records without assuming one schema."""
+    found = []
+    if isinstance(node, dict):
+        low = {str(k).lower(): v for k, v in node.items()}
+        to = low.get("to") or low.get("recipient") or low.get("receiver") or low.get("phone") or low.get("number")
+        body = low.get("message") or low.get("body") or low.get("text") or low.get("content")
+        if to is not None and body is not None:
+            key = str(low.get("id") or low.get("timestamp") or path or hash((str(to), str(body))))
+            found.append({"key": key, "to": str(to), "body": str(body), "path": path})
+        for k, v in node.items():
+            found.extend(_sms_from_tree(v, f"{path}/{k}"))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            found.extend(_sms_from_tree(v, f"{path}/{i}"))
+    return found
+
+
+async def _firebase_json(url: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(_clean_url(url) + ".json", timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Firebase HTTP {resp.status}")
+            return await resp.json(content_type=None)
+
+
+async def _forward_sms(bot: Bot, u: dict, sms: dict):
+    targets = list(dict.fromkeys(u.get("fwd", [])))
+    if not targets:
+        return
+    text = (
+        "📩 <b>SMS Forward</b>\n"
+        f"📱 <b>To:</b> <code>{sms['to']}</code>\n"
+        f"💬 <b>Message:</b> {sms['body']}"
+    )
+    for target in targets:
         try:
-            if source_message is not None:
-                # Native forward is faster and preserves the original message link.
-                return await bot.forward_message(
-                    chat_id=chat_id,
-                    from_chat_id=source_message.chat.id,
-                    message_id=source_message.message_id,
-                )
-            return await bot.send_message(chat_id=chat_id, text=str(text))
-        except TelegramRetryAfter as exc:
-            if attempt == 1:
-                raise
-            await asyncio.sleep(min(float(exc.retry_after), 3.0))
-
-
-async def forward_to_configured_chats(
-    bot: Bot,
-    uid: int,
-    d: dict,
-    text: str | None = None,
-    source_message: Message | None = None,
-) -> dict:
-    """Fast-forward a message to all configured chats concurrently.
-
-    For a Telegram Message, native `forward_message` is used. For an SMS
-    result or other plain text, `send_message` is used. Each destination is
-    isolated, so one blocked/invalid chat cannot stop the others.
-    """
-    destinations = list(_fwd_list(usr(uid, d)))
-    if not destinations:
-        return {"sent": [], "failed": []}
-    if source_message is None and not text:
-        raise ValueError("text or source_message is required")
-
-    async def deliver(raw_chat_id: str):
-        try:
-            await _forward_one(bot, raw_chat_id, text, source_message)
-            return (raw_chat_id, None)
+            await bot.send_message(_chat_id(str(target)), text)
         except Exception as exc:
-            log.warning("Forward failed to %s for uid=%s: %s", raw_chat_id, uid, exc)
-            return (raw_chat_id, str(exc))
-
-    # Concurrent delivery is substantially faster for multiple destinations.
-    results = await asyncio.gather(*(deliver(chat_id) for chat_id in destinations))
-    return {
-        "sent": [chat_id for chat_id, error in results if error is None],
-        "failed": [{"chat_id": chat_id, "error": error} for chat_id, error in results if error is not None],
-    }
+            log.warning("Forward failed to %s: %s", target, exc)
 
 
-# This router is intentionally separate so existing bot handlers can include it
-# without changing their current callback/message routing.
-fwd_router = Router(name="message_forwarding")
+async def _monitor_user(bot: Bot, uid: int):
+    while True:
+        d = load()
+        u = usr(uid, d)
+        if not u.get("monitoring"):
+            return
+        fb_url = (u.get("active") or {}).get("fb_url")
+        if not fb_url:
+            u["monitoring"] = False
+            save(d)
+            return
+        try:
+            data = await _firebase_json(fb_url)
+            seen = _SEEN_SMS.setdefault(uid, set())
+            for sms in _sms_from_tree(data):
+                if sms["key"] not in seen:
+                    seen.add(sms["key"])
+                    await _forward_sms(bot, u, sms)
+            # Keep memory bounded during long-running monitoring.
+            if len(seen) > 2000:
+                _SEEN_SMS[uid] = set(list(seen)[-1000:])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Monitor uid=%s failed: %s", uid, exc)
+        await asyncio.sleep(max(3, int(_POLL_CFG.get("interval", 4))))
 
 
-@fwd_router.callback_query(F.data == "fwd:menu")
-async def fwd_menu_callback(call: CallbackQuery, state: FSMContext):
-    d = load()
-    uid = call.from_user.id
-    if not can_use(uid, d):
-        await call.answer("Access denied", show_alert=True)
-        return
+async def _start_monitor(bot: Bot, uid: int, d: dict):
     u = usr(uid, d)
-    await call.message.edit_text(
-        "📤 <b>Message Forwarding</b>\n\n"
-        "Add destination chat IDs or @usernames. SMS results can then be\n"
-        "forwarded there by calling <code>forward_to_configured_chats()</code>.\n\n"
-        f"Configured: <b>{len(_fwd_list(u))}</b>",
-        reply_markup=fwd_menu_kb(u),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@fwd_router.callback_query(F.data == "fwd:add")
-async def fwd_add_callback(call: CallbackQuery, state: FSMContext):
-    d = load()
-    if not can_use(call.from_user.id, d):
-        await call.answer("Access denied", show_alert=True)
-        return
-    await state.set_state(W.fwd_add)
-    await call.message.answer(
-        "📤 Send the destination chat ID.\n\n"
-        "Examples:\n<code>-1001234567890</code>\n<code>@my_channel</code>\n\n"
-        "The bot must be a member/admin in the target chat.",
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@fwd_router.message(W.fwd_add)
-async def fwd_add_message(message: Message, state: FSMContext):
-    d = load()
-    uid = message.from_user.id
-    if not can_use(uid, d):
-        await state.clear()
-        return
-    raw = (message.text or "").strip()
-    try:
-        parsed = _parse_chat_id(raw)
-    except ValueError:
-        await message.answer("❌ Invalid ID. Numeric chat ID ya @username bhejo.")
-        return
-
-    u = usr(uid, d)
-    values = _fwd_list(u)
-    normalized = str(parsed)
-    if normalized not in values:
-        values.append(normalized)
-        u["fwd"] = values
-        save(d)
-        await message.answer(f"✅ Forward destination added: <code>{normalized}</code>", parse_mode="HTML")
-    else:
-        await message.answer("ℹ️ Yeh destination already configured hai.")
-    await state.clear()
-
-
-@fwd_router.callback_query(F.data.startswith("fwd:del:"))
-async def fwd_delete_callback(call: CallbackQuery):
-    d = load()
-    uid = call.from_user.id
-    if not can_use(uid, d):
-        await call.answer("Access denied", show_alert=True)
-        return
-    chat_id = call.data.split(":", 2)[2]
-    u = usr(uid, d)
-    u["fwd"] = [x for x in _fwd_list(u) if x != chat_id]
+    if not (u.get("active") or {}).get("fb_url"):
+        return False
+    u["monitoring"] = True
     save(d)
-    await call.answer("Destination removed")
-    await call.message.edit_reply_markup(reply_markup=fwd_menu_kb(u))
+    old = _MONITOR_TASKS.get(uid)
+    if old and not old.done():
+        old.cancel()
+    _MONITOR_TASKS[uid] = asyncio.create_task(_monitor_user(bot, uid))
+    return True
 
 
-@fwd_router.callback_query(F.data == "fwd:test")
-async def fwd_test_callback(call: CallbackQuery):
-    d = load()
-    uid = call.from_user.id
-    if not can_use(uid, d):
-        await call.answer("Access denied", show_alert=True)
-        return
-    u = usr(uid, d)
-    if not _fwd_list(u):
-        await call.answer("Pehle destination add karo", show_alert=True)
-        return
-    result = await forward_to_configured_chats(
-        call.bot,
-        uid,
-        d,
-        text="✅ Test message: forwarding is working correctly.",
-    )
-    await call.answer(f"Sent: {len(result['sent'])}, Failed: {len(result['failed'])}", show_alert=True)
+async def _stop_monitor(uid: int, d: dict):
+    usr(uid, d)["monitoring"] = False
+    save(d)
+    task = _MONITOR_TASKS.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
 
 
-def register_forwarding(dispatcher: Dispatcher) -> None:
-    """Register forwarding handlers once in the bot startup code.
-
-    Example:
-        dp = Dispatcher(storage=MemoryStorage())
-        register_forwarding(dp)
-    """
-    dispatcher.include_router(fwd_router)
+router = Router()
 
 
-@fwd_router.message(Command("start"))
-async def forwarding_start(message: Message):
+@router.message(Command("start"))
+async def cmd_start(message: Message):
     d = load()
     uid = message.from_user.id
     if is_banned(uid, d):
-        await message.answer("🚫 You are banned.")
+        await message.answer("🚫 You are blocked.")
         return
-    # Existing users/admins get the normal menu; new users see the same menu
-    # and can be granted access through the existing admin data model.
-    await message.answer(
-        home_text(uid, d),
-        reply_markup=main_menu(uid, d),
-        parse_mode="HTML",
-    )
+    await message.answer(home_text(uid, d), reply_markup=main_menu(uid, d))
 
 
-@fwd_router.callback_query(F.data == "home")
-async def forwarding_home_callback(call: CallbackQuery):
+@router.message(Command("setup"))
+async def cmd_setup(message: Message, state: FSMContext):
     d = load()
-    uid = call.from_user.id
-    await call.message.edit_text(
-        home_text(uid, d),
-        reply_markup=main_menu(uid, d),
-        parse_mode="HTML",
-    )
+    if not can_use(message.from_user.id, d):
+        await message.answer("🔒 Access denied.")
+        return
+    await state.set_state(W.fb_url)
+    await message.answer("🔥 Firebase URL bhejo (example: https://project.firebaseio.com):")
+
+
+@router.message(Command("forward_here"))
+async def cmd_forward_here(message: Message):
+    d = load(); uid = message.from_user.id
+    if not can_use(uid, d):
+        await message.answer("🔒 Access denied."); return
+    u = usr(uid, d)
+    if message.chat.id not in u["fwd"]:
+        u["fwd"].append(message.chat.id); save(d)
+    await message.answer(f"✅ SMS forwarding enabled for this chat: <code>{message.chat.id}</code>")
+
+
+@router.message(W.fb_url)
+async def setup_fb(message: Message, state: FSMContext):
+    d = load(); u = usr(message.from_user.id, d)
+    url = _clean_url(message.text or "")
+    if not url.startswith(("http://", "https://")):
+        await message.answer("❌ Valid Firebase URL bhejo."); return
+    u["active"] = {"fb_url": url, "sims": [], "repeat": 1}
+    if not any(x.get("url") == url for x in u.get("firebases", [])):
+        u.setdefault("firebases", []).append({"id": str(int(time.time())), "url": url})
+    save(d)
+    await state.set_state(W.ch_input)
+    await message.answer("📺 Channel/device path optional hai. Ab Telegram forwarding chat ID bhejo, ya `skip` likho:")
+
+
+@router.message(W.ch_input)
+async def setup_forward(message: Message, state: FSMContext):
+    d = load(); u = usr(message.from_user.id, d)
+    value = (message.text or "").strip()
+    if value.lower() != "skip":
+        try:
+            target = _chat_id(value)
+            if target not in u["fwd"]: u["fwd"].append(target)
+        except Exception:
+            await message.answer("❌ Chat ID sahi format mein bhejo ya `skip` likho."); return
+    save(d); await state.clear()
+    await message.answer("✅ Setup complete. `Start Monitor` dabao ya /monitor_start use karo.", reply_markup=main_menu(message.from_user.id, d))
+
+
+@router.message(Command("monitor_start"))
+async def cmd_monitor_start(message: Message):
+    d = load(); uid = message.from_user.id
+    if await _start_monitor(bot_instance, uid, d):
+        await message.answer("🟢 Monitoring started.")
+    else:
+        await message.answer("⚠️ Pehle /setup complete karo.")
+
+
+@router.message(Command("monitor_stop"))
+async def cmd_monitor_stop(message: Message):
+    d = load(); await _stop_monitor(message.from_user.id, d)
+    await message.answer("🔴 Monitoring stopped.")
+
+
+@router.callback_query()
+async def callbacks(call: CallbackQuery, state: FSMContext):
+    d = load(); uid = call.from_user.id; data = call.data or ""
+    try:
+        if data == "noop":
+            await call.answer(); return
+        if data == "home":
+            await call.message.edit_text(home_text(uid, d), reply_markup=main_menu(uid, d)); return
+        if data == "help:show":
+            await call.message.edit_text(HELP_TEXT, reply_markup=kb([("🔙 Back", "home")])); return
+        if data == "fwd:menu":
+            await call.message.edit_text("📤 <b>SMS Forwarding</b>\n\nUse /forward_here in the target chat, or add a numeric chat ID below.", reply_markup=fwd_kb(usr(uid, d))); return
+        if data == "fwd:add":
+            await state.set_state(W.fwd_add); await call.message.answer("Target Telegram chat ID bhejo:"); return
+        if data.startswith("fwd:del:"):
+            target = data.split(":", 2)[2]; u = usr(uid, d)
+            u["fwd"] = [x for x in u.get("fwd", []) if str(x) != target]; save(d)
+            await call.message.edit_reply_markup(reply_markup=fwd_kb(u)); return
+        if data == "wiz:start":
+            await state.set_state(W.fb_url); await call.message.answer("🔥 Firebase URL bhejo:"); return
+        if data == "mon:go":
+            u = usr(uid, d)
+            if u.get("monitoring"):
+                await _stop_monitor(uid, d); await call.answer("Monitoring stopped")
+            elif await _start_monitor(bot_instance, uid, d):
+                await call.answer("Monitoring started")
+            else:
+                await call.answer("Pehle Setup Wizard complete karo", show_alert=True)
+            await call.message.edit_text(home_text(uid, d), reply_markup=main_menu(uid, d)); return
+        if data == "dash:show":
+            await call.message.edit_text(stats_card(usr(uid, d)), reply_markup=kb([("🔙 Back", "home")])); return
+    except Exception as exc:
+        log.exception("Callback failed: %s", exc)
     await call.answer()
 
 
-def build_dispatcher() -> Dispatcher:
-    """Create a ready-to-run dispatcher with forwarding wired in."""
-    dp = Dispatcher(storage=MemoryStorage())
-    register_forwarding(dp)
-    return dp
+@router.message(W.fwd_add)
+async def add_forward_target(message: Message, state: FSMContext):
+    d = load(); u = usr(message.from_user.id, d); value = (message.text or "").strip()
+    try:
+        target = _chat_id(value)
+        if target not in u["fwd"]: u["fwd"].append(target)
+        save(d); await state.clear(); await message.answer("✅ Forward target added.")
+    except Exception:
+        await message.answer("❌ Valid Telegram chat ID bhejo.")
+
+
+bot_instance: Bot | None = None
 
 
 async def main():
-    if not BOT_TOKEN or BOT_TOKEN.startswith("PUT_"):
-        raise RuntimeError("BOT_TOKEN is missing")
-    bot = Bot(BOT_TOKEN)
-    dp = build_dispatcher()
-    log.info("Bot started with fast message forwarding enabled")
-    await dp.start_polling(bot)
+    global bot_instance
+    bot_instance = Bot(BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await dp.start_polling(bot_instance)
 
 
-
-# ══════════════════════════════════════════════
-#  UI FALLBACKS / BASIC BUTTON ROUTES
-# ══════════════════════════════════════════════
-
-
-@fwd_router.callback_query(F.data == "noop")
-async def noop_callback(call: CallbackQuery):
-    await call.answer("Yeh item sirf information ke liye hai.")
-
-
-@fwd_router.callback_query(F.data == "help:show")
-async def help_callback(call: CallbackQuery):
-    await call.message.edit_text(HELP_TEXT, reply_markup=kb([("🔙 Back", "home")]), parse_mode="HTML")
-    await call.answer()
-
-
-@fwd_router.callback_query(F.data == "dash:show")
-async def dashboard_callback(call: CallbackQuery):
-    d = load()
-    u = usr(call.from_user.id, d)
-    await call.message.edit_text(
-        f"📊 <b>Dashboard</b>\n\n{stats_card(u)}",
-        reply_markup=kb([("🔙 Back", "home")]),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@fwd_router.callback_query(F.data == "my:menu")
-async def settings_callback(call: CallbackQuery):
-    d = load()
-    u = usr(call.from_user.id, d)
-    await call.message.edit_text(
-        f"⚙️ <b>My Settings</b>\n\n{setup_card(u)}\n\n"
-        f"Forward destinations: <b>{len(_fwd_list(u))}</b>",
-        reply_markup=kb(
-            [("📤 Forward Settings", "fwd:menu")],
-            [("🔙 Back", "home")],
-        ),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@fwd_router.callback_query(F.data == "mon:go")
-async def monitor_callback(call: CallbackQuery):
-    d = load()
-    uid = call.from_user.id
-    u = usr(uid, d)
-    u["monitoring"] = not bool(u.get("monitoring"))
-    save(d)
-    status = "started" if u["monitoring"] else "stopped"
-    await call.answer(f"Monitor {status}")
-    await call.message.edit_text(
-        home_text(uid, d),
-        reply_markup=main_menu(uid, d),
-        parse_mode="HTML",
-    )
-
-
-@fwd_router.callback_query(F.data == "wiz:start")
-async def wizard_callback(call: CallbackQuery):
-    await call.message.edit_text(
-        "🧙 <b>Setup Wizard</b>\n\n"
-        "Wizard controls are available in this build after Firebase/device/channel "
-        "credentials are configured. Forwarding can be configured independently.",
-        reply_markup=kb(
-            [("📤 Configure Forwarding", "fwd:menu")],
-            [("🔙 Back", "home")],
-        ),
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-
-@fwd_router.callback_query()
-async def unmatched_callback(call: CallbackQuery):
-    """Always acknowledge unknown callbacks so Telegram buttons do not spin."""
-    await call.answer("Is button ka action is build mein available nahi hai.", show_alert=True)
-
-
-# Start polling only after every router handler above has been registered.
 if __name__ == "__main__":
     asyncio.run(main())
